@@ -18,16 +18,35 @@ pub const Pattern = struct {
             set: std.StaticBitSet(1 << 8),
             next: usize,
         },
+
+        // for debugging
+        pub fn format(self: State, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+            _ = fmt;
+            _ = options;
+            try writer.print("{s: >6}", .{@tagName(self)});
+            switch (self) {
+                .accept => {},
+                .split => |next| try writer.print("     -> {} {}", .{ next[0], next[1] }),
+                .lit => |lit| try writer.print(" '{}' -> {}", .{ std.fmt.fmtSliceEscapeLower(&.{lit.ch}), lit.next }),
+                .set => |set| try writer.print(" #set -> {}", .{set.next}), // TODO
+            }
+        }
     };
     const Fragment = struct {
         start: usize,
         out: []const *usize,
+
+        fn patch(self: Fragment, out: usize) void {
+            for (self.out) |p| {
+                p.* = out;
+            }
+        }
     };
 
     pub fn init(comptime pattern: []const u8, comptime flags: PatternFlags) Pattern {
         const toks = comptime parse(pattern);
         comptime var stack: []const Fragment = &.{};
-        comptime var states: [toks.len + 1]State = undefined; // +1 because of accept state
+        comptime var states: [toks.len + 1]State = undefined; // +1 because accept state is not represented in the tokens
         comptime var statei: usize = 0;
 
         comptime for (toks) |tok| switch (tok) {
@@ -65,21 +84,63 @@ pub const Pattern = struct {
                 statei += 1;
             },
 
-            .repeat => unreachable, // TODO
+            // TODO: greedy vs. ungreedy
+            .repeat => |repeat| {
+                // Pop repeated fragment
+                const frag = stack[stack.len - 1];
+                stack.len -= 1;
+
+                // Create split node
+                states[statei] = .{ .split = .{
+                    frag.start,
+                    undefined,
+                } };
+                const split_out = [_]*usize{&states[statei].split[1]};
+
+                switch (repeat.kind) {
+                    .star => {
+                        // Patch repeated fragment
+                        frag.patch(statei);
+                        // Push fragment starting with split node
+                        stack = stack ++ [_]Fragment{.{
+                            .start = statei,
+                            .out = &split_out,
+                        }};
+                    },
+
+                    .plus => {
+                        // Patch repeated fragment
+                        frag.patch(statei);
+                        // Push fragment starting with repeated fragment
+                        stack = stack ++ [_]Fragment{.{
+                            .start = frag.start,
+                            .out = &split_out,
+                        }};
+                    },
+
+                    .question => {
+                        // Push fragment starting with split node
+                        stack = stack ++ [_]Fragment{.{
+                            .start = statei,
+                            .out = frag.out ++ split_out,
+                        }};
+                    },
+                }
+
+                statei += 1;
+            },
 
             // TODO: capture groups
             .group => |group| if (group.n > 0) {
                 // Store out array of top fragment for later
                 const out = stack[stack.len - 1].out;
 
-                // Pop and link all but last fragment
+                // Concat grouped fragments
                 var i = 1;
                 while (i < group.n) : (i += 1) {
                     const frag = stack[stack.len - 1];
                     stack.len -= 1;
-                    for (stack[stack.len - 1].out) |p| {
-                        p.* = frag.start;
-                    }
+                    stack[stack.len - 1].patch(frag.start);
                 }
 
                 // Patch in the new out array
@@ -100,9 +161,7 @@ pub const Pattern = struct {
             var i = stack.len;
             while (i > 0) {
                 i -= 1;
-                for (stack[i].out) |p| {
-                    p.* = state;
-                }
+                stack[i].patch(state);
                 state = stack[i].start;
             }
         }
@@ -115,7 +174,12 @@ pub const Pattern = struct {
         };
     }
 
-    pub fn match(comptime self: Pattern, str: []const u8) bool {
+    pub fn matchStr(comptime self: Pattern, str: []const u8) bool {
+        var stream = std.io.fixedBufferStream(str);
+        return self.match(stream.reader()) catch |err| switch (err) {};
+    }
+
+    pub fn match(comptime self: Pattern, r: anytype) !bool {
         const Set = std.StaticBitSet(self.states.len);
         const EvalState = if (@sizeOf(Set) <= @sizeOf(usize))
             struct {
@@ -145,38 +209,42 @@ pub const Pattern = struct {
 
         var state = EvalState{};
         state.init();
-        state.front.set(0);
+        state.front.set(self.start);
 
-        for (str) |ch| {
+        var ch: ?u8 = undefined;
+        var get_next = true;
+        while (true) {
+            if (get_next) {
+                // We've consumed a byte, get the next one
+                ch = r.readByte() catch |err| switch (err) {
+                    error.EndOfStream => null,
+                    else => |e| return e,
+                };
+                get_next = false;
+            } else if (state.front.findFirstSet() == null) {
+                // All routes have failed
+                return false;
+            }
+
             state.swap();
             var it = state.back.iterator(.{});
             while (it.next()) |i| switch (self.states[i]) {
-                .accept => return true,
+                .accept => return true, // A route has succeded
+
                 .split => |next| {
                     state.front.set(next[0]);
                     state.front.set(next[1]);
                 },
-                .lit => |lit| if (lit.ch == ch) {
+                .lit => |lit| if (ch) |c| if (lit.ch == c) {
                     state.front.set(lit.next);
+                    get_next = true;
                 },
-                .set => |set| if (set.set.isSet(ch)) {
+                .set => |set| if (ch) |c| if (set.set.isSet(c)) {
                     state.front.set(set.next);
+                    get_next = true;
                 },
             };
-
-            if (state.front.findFirstSet() == null) {
-                // All routes have failed
-                return false;
-            }
         }
-
-        var it = state.front.iterator(.{});
-        while (it.next()) |i| {
-            if (self.states[i] == .accept) {
-                return true;
-            }
-        }
-        return false;
     }
 
     const StateList = std.ArrayListUnmanaged(usize);
@@ -191,27 +259,45 @@ pub const PatternFlags = struct {
 
 test "literal pattern" {
     const pat = comptime Pattern.init("Hello, world!", .{});
-    try std.testing.expect(pat.match("Hello, world!"));
-    try std.testing.expect(pat.match("Hello, world! foobar"));
-    try std.testing.expect(!pat.match("Hello, world"));
-    try std.testing.expect(!pat.match("Hello, world !"));
-    try std.testing.expect(!pat.match("Hello, world foobar"));
-    try std.testing.expect(!pat.match("Hello"));
+    try std.testing.expect(pat.matchStr("Hello, world!"));
+    try std.testing.expect(pat.matchStr("Hello, world! foobar"));
+    try std.testing.expect(!pat.matchStr("Hello, world"));
+    try std.testing.expect(!pat.matchStr("Hello, world !"));
+    try std.testing.expect(!pat.matchStr("Hello, world foobar"));
+    try std.testing.expect(!pat.matchStr("Hello"));
 }
 
 test "capture groups" {
     const pat = comptime Pattern.init("(ab)(cd)ef", .{});
-    try std.testing.expect(pat.match("abcdef"));
-    try std.testing.expect(!pat.match("(ab)(cd)ef"));
+    try std.testing.expect(pat.matchStr("abcdef"));
+    try std.testing.expect(!pat.matchStr("(ab)(cd)ef"));
 }
 
-// TODO
-// test "repetition" {
-//     const pat = Pattern.init("a*b", .{});
-// }
-// test "complex pattern" {
-//     const pat = Pattern.init("Hello, (hello, )* wo+rld!?", .{});
-// }
+test "repetition" {
+    const pat = comptime Pattern.init("a*b", .{});
+    try std.testing.expect(pat.matchStr("b"));
+    try std.testing.expect(pat.matchStr("ab"));
+    try std.testing.expect(pat.matchStr("abc"));
+    try std.testing.expect(pat.matchStr("aaaaaaab"));
+    try std.testing.expect(pat.matchStr("aaaaaaabaa"));
+    try std.testing.expect(!pat.matchStr("c"));
+    try std.testing.expect(!pat.matchStr("acb"));
+    try std.testing.expect(!pat.matchStr("aaaacb"));
+}
+
+test "complex pattern" {
+    const pat = comptime Pattern.init("Hello, (hello, )*wo+rld!?", .{});
+    try std.testing.expect(pat.matchStr("Hello, world!"));
+    try std.testing.expect(pat.matchStr("Hello, world"));
+    try std.testing.expect(pat.matchStr("Hello, wooooorld"));
+    try std.testing.expect(pat.matchStr("Hello, wooooorld!"));
+    try std.testing.expect(pat.matchStr("Hello, hello, hello, world!"));
+    try std.testing.expect(pat.matchStr("Hello, hello, hello, woooooorld!"));
+    try std.testing.expect(pat.matchStr("Hello, hello, wooorld"));
+    try std.testing.expect(!pat.matchStr("hello, hello, wooorld"));
+    try std.testing.expect(!pat.matchStr("Hello, hello, wrld"));
+    try std.testing.expect(!pat.matchStr("Hello, Hello, world!"));
+}
 
 /// Parses a regex pattern into a sequence of tokens
 fn parse(comptime pattern: []const u8) []const Token {
