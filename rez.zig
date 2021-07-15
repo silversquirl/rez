@@ -63,13 +63,25 @@ pub const Pattern = struct {
                 statei += 1;
             },
 
-            .class => unreachable,
+            .class => |set| {
+                // Push set match
+                states[statei] = .{ .set = .{
+                    .set = set,
+                    .next = undefined,
+                } };
+                stack = stack ++ [_]Fragment{.{
+                    .start = statei,
+                    .out = &.{&states[statei].set.next},
+                }};
+                statei += 1;
+            },
 
             .dot => {
                 // Create char set
                 var set = std.StaticBitSet(1 << 8).initFull();
                 if (!flags.oneline) {
-                    set.unset('.');
+                    set.unset('\r');
+                    set.unset('\n');
                 }
 
                 // Push set match
@@ -267,7 +279,57 @@ test "literal pattern" {
     try std.testing.expect(!pat.matchStr("Hello"));
 }
 
-test "capture groups" {
+test "character class" {
+    const pat = comptime Pattern.init("a[bcd]e[f-i]j", .{});
+    try std.testing.expect(pat.matchStr("abefj"));
+    try std.testing.expect(pat.matchStr("acegj"));
+    try std.testing.expect(pat.matchStr("adehj"));
+    try std.testing.expect(pat.matchStr("abeij"));
+    try std.testing.expect(!pat.matchStr("aeefj"));
+    try std.testing.expect(!pat.matchStr("abejj"));
+    try std.testing.expect(!pat.matchStr("ace-j"));
+    try std.testing.expect(!pat.matchStr("adeej"));
+}
+
+test "dot" {
+    const pat = comptime Pattern.init(
+        \\a.b\.c
+    , .{});
+    try std.testing.expect(pat.matchStr("a*b.c"));
+    try std.testing.expect(pat.matchStr("axb.c"));
+    try std.testing.expect(pat.matchStr("a1b.c"));
+    try std.testing.expect(pat.matchStr("a-b.c"));
+    try std.testing.expect(pat.matchStr("a.b.c"));
+    try std.testing.expect(!pat.matchStr("a\nb.c"));
+    try std.testing.expect(!pat.matchStr("a\rb.c"));
+    try std.testing.expect(!pat.matchStr("a*b*c"));
+    try std.testing.expect(!pat.matchStr("axbxc"));
+    try std.testing.expect(!pat.matchStr("a1b1c"));
+    try std.testing.expect(!pat.matchStr("a-b-c"));
+    try std.testing.expect(!pat.matchStr("a.b,c"));
+}
+
+test "dot oneline" {
+    const pat = comptime Pattern.init(
+        \\a.b\.c
+    , .{ .oneline = true });
+    try std.testing.expect(pat.matchStr("a*b.c"));
+    try std.testing.expect(pat.matchStr("axb.c"));
+    try std.testing.expect(pat.matchStr("a1b.c"));
+    try std.testing.expect(pat.matchStr("a-b.c"));
+    try std.testing.expect(pat.matchStr("a.b.c"));
+    try std.testing.expect(pat.matchStr("a\nb.c"));
+    try std.testing.expect(pat.matchStr("a\rb.c"));
+    try std.testing.expect(!pat.matchStr("a*b*c"));
+    try std.testing.expect(!pat.matchStr("axbxc"));
+    try std.testing.expect(!pat.matchStr("a1b1c"));
+    try std.testing.expect(!pat.matchStr("a-b-c"));
+    try std.testing.expect(!pat.matchStr("a.b,c"));
+    try std.testing.expect(!pat.matchStr("a\nb\nc"));
+    try std.testing.expect(!pat.matchStr("a\rb\rc"));
+}
+
+test "capture group" {
     const pat = comptime Pattern.init("(ab)(cd)ef", .{});
     try std.testing.expect(pat.matchStr("abcdef"));
     try std.testing.expect(!pat.matchStr("(ab)(cd)ef"));
@@ -302,21 +364,30 @@ test "complex pattern" {
 /// Parses a regex pattern into a sequence of tokens
 fn parse(comptime pattern: []const u8) []const Token {
     comptime {
+        var stream = std.io.fixedBufferStream(pattern);
+        const r = stream.reader();
+        const err = struct {
+            fn unexpected(sym: []const u8) noreturn {
+                @compileError(std.fmt.comptimePrint(
+                    "Unexpected '{}' at index {}",
+                    .{ std.fmt.fmtSliceEscapeLower(sym), stream.pos },
+                ));
+            }
+
+            fn unclosed(thing: []const u8, start: usize) noreturn {
+                @compileError(std.fmt.comptimePrint(
+                    "Unclosed {s} starting at index {}",
+                    .{ thing, start },
+                ));
+            }
+        };
+
         var groups: usize = 0;
         var stack: []const usize = &.{}; // Group stack - stores start indices into toks
         var toks: []const Token = &.{}; // Output token stream
         var escape = false;
 
-        for (pattern) |ch, i| {
-            const err = struct {
-                fn unexpected(comptime sym: []const u8) noreturn {
-                    @compileError(std.fmt.comptimePrint(
-                        "Unexpected '{}' at index {}",
-                        .{ std.fmt.fmtSliceEscapeLower(sym), i },
-                    ));
-                }
-            };
-
+        while (r.readByte()) |ch| {
             var tok: ?Token = null;
             if (escape) {
                 escape = false;
@@ -324,7 +395,54 @@ fn parse(comptime pattern: []const u8) []const Token {
             } else switch (ch) {
                 '\\' => escape = true,
 
-                '[' => unreachable,
+                '[' => {
+                    const start = stream.pos;
+                    var set = std.StaticBitSet(1 << 8).initEmpty();
+                    var invert = false;
+                    var prev: ?u8 = null;
+                    while (r.readByte()) |ch2| {
+                        const at_start = stream.pos == start + 1;
+                        if (escape) {
+                            escape = false;
+                        } else switch (ch2) {
+                            '\\' => { // Escape char
+                                escape = true;
+                                continue;
+                            },
+                            '^' => if (at_start) { // Invert set
+                                invert = true;
+                                continue;
+                            },
+
+                            '-' => if (prev) |sc| {
+                                var ec = r.readByte() catch continue;
+                                if (ec == ']') { // Trailing -, add it to the set and finish
+                                    set.set(ch2);
+                                    break;
+                                }
+
+                                while (ec > sc) : (ec -= 1) {
+                                    set.set(ec);
+                                }
+                                continue;
+                            },
+
+                            ']' => break, // End of set
+                            else => {},
+                        }
+
+                        set.set(ch2);
+                        prev = ch2;
+                    } else |e| switch (e) {
+                        error.EndOfStream => err.unclosed("character class", start),
+                    }
+
+                    if (invert) {
+                        set.toggleAll();
+                    }
+                    tok = .{ .class = set };
+                },
+
                 '.' => tok = .dot,
 
                 '*' => tok = .{ .repeat = .{ .kind = .star } },
@@ -369,13 +487,12 @@ fn parse(comptime pattern: []const u8) []const Token {
             if (tok) |t| {
                 toks = toks ++ [_]Token{t};
             }
+        } else |e| switch (e) {
+            error.EndOfStream => {},
         }
 
         if (stack.len > 0) {
-            @compileError(std.fmt.comptimePrint(
-                "Unclosed group starting at index {}",
-                .{stack[stack.len - 1]},
-            ));
+            err.unclosed("group", stack[stack.len - 1]);
         }
 
         return toks;
@@ -384,7 +501,7 @@ fn parse(comptime pattern: []const u8) []const Token {
 
 const Token = union(enum) {
     ch: u8, // Literal character (TODO: unicode support)
-    class: []const u8, // Character class, as an un-parsed string
+    class: std.StaticBitSet(1 << 8), // Character class (TODO: unicode support)
     dot: void, // Dot (any char, or [^\r\n] depending on oneline flag)
     repeat: struct { // Repetition: *, + or ?
         kind: enum { star, plus, question },
@@ -448,6 +565,46 @@ test "parse" {
         .{ .ch = '(' },
     },
         \\ \.\*\+\{\(
+    );
+
+    try expectParse(&.{
+        .{ .ch = ' ' },
+        .{ .class = comptime blk: {
+            var set = std.StaticBitSet(1 << 8).initEmpty();
+            var i: u8 = 'a';
+            while (i <= 'z') : (i += 1) {
+                set.set(i);
+            }
+            set.set(']');
+            set.set('\\');
+            break :blk set;
+        } },
+        .{ .repeat = .{ .kind = .plus } },
+        .{ .class = comptime blk: {
+            var set = std.StaticBitSet(1 << 8).initEmpty();
+            set.set('-');
+            set.set('a');
+            break :blk set;
+        } },
+        .{ .class = comptime blk: {
+            var set = std.StaticBitSet(1 << 8).initFull();
+            set.unset('a');
+            set.unset('b');
+            set.unset('c');
+            break :blk set;
+        } },
+        .{ .class = comptime blk: {
+            var set = std.StaticBitSet(1 << 8).initFull();
+            var i: u8 = 'a';
+            while (i <= 'z') : (i += 1) {
+                set.unset(i);
+            }
+            set.unset('A');
+            set.unset('-');
+            break :blk set;
+        } },
+    },
+        \\ [a-z\]\\]+[-a][^abc][^a-zA-]
     );
 }
 
